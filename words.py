@@ -8,7 +8,7 @@ _GUESSES_URL = (
 )
 _ANSWERS_URL = (
     "https://raw.githubusercontent.com/Kinkelin/WordleCompetition"
-    "/main/data/official/official_answers.txt"
+    "/main/data/official/shuffled_real_wordles.txt"
 )
 
 
@@ -19,7 +19,11 @@ def _fetch(url: str, fname: str) -> list[str]:
         print(f"Downloading {url} ...")
         urllib.request.urlretrieve(url, path)
     with open(path) as f:
-        return [w.strip().lower() for w in f if w.strip()]
+        return [
+            w.strip().lower()
+            for w in f
+            if w.strip() and not w.startswith("#")
+        ]
 
 
 def _load():
