@@ -34,6 +34,7 @@ class WordleEnv(gym.Env):
         self,
         answers: list[str] | None = None,
         action_words: list[str] | None = None,
+        target_vocab: list[str] | None = None,
         shaped_reward: bool = True,
         render_mode: str | None = None,
     ) -> None:
@@ -42,6 +43,9 @@ class WordleEnv(gym.Env):
         self.action_words: list[str] = (
             action_words if action_words is not None else self.answers
         )
+        # Curriculum hook: if set, targets are sampled from this list instead
+        # of self.answers.  Modify it in-place to change difficulty mid-run.
+        self.target_vocab: list[str] | None = target_vocab
         self.shaped_reward = shaped_reward
         self.render_mode = render_mode
 
@@ -68,7 +72,8 @@ class WordleEnv(gym.Env):
         self, *, seed: int | None = None, options: dict | None = None
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-        self._target = self.answers[self.np_random.integers(len(self.answers))]
+        pool = self.target_vocab if self.target_vocab else self.answers
+        self._target = pool[self.np_random.integers(len(pool))]
         self._state = np.zeros(60, dtype=np.float32)
         self._n_guesses = 0
         self._done = False

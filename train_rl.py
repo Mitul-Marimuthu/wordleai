@@ -3,17 +3,29 @@ Train a PPO agent to play Wordle.
 
 Usage
 -----
-  python train_rl.py                     # train with default settings
-  python train_rl.py --timesteps 2000000
-  python train_rl.py --eval              # evaluate a saved model
+  python train_rl.py                          # 1 M steps, no curriculum
+  python train_rl.py --curriculum             # staged vocab expansion
+  python train_rl.py --timesteps 3000000 --curriculum
+  python train_rl.py --eval                   # evaluate a saved model
+  python train_rl.py --eval --n_eval 1000
+
+Curriculum design
+-----------------
+Action space stays fixed at Discrete(2315) throughout training so the PPO
+policy network never needs to be rebuilt.  Curriculum changes only the
+*target* pool — the word the agent must guess — via a shared mutable list.
+
+Stages: 50 → 150 → 400 → 1 000 → 2 315 words.
+Advance when eval win-rate on the current vocab reaches 80 %.
 """
 
 import argparse
 import os
+import random
 
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecMonitor
 
@@ -23,32 +35,85 @@ from words import ANSWERS
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "ppo_wordle")
 LOG_PATH = os.path.join(os.path.dirname(__file__), "logs")
 
+# Vocab sizes at each curriculum stage
+STAGES = [50, 150, 400, 1_000, 2_315]
+
+
+# ---------------------------------------------------------------------------
+# Curriculum callback
+# ---------------------------------------------------------------------------
+
+class CurriculumCallback(BaseCallback):
+    """
+    Periodically evaluates the policy on the current target vocab.
+    When win-rate >= win_threshold, the target vocab is expanded in-place
+    to the next stage.  All training and eval envs see the change immediately
+    on their next reset() because they hold a reference to the same list.
+    """
+
+    def __init__(
+        self,
+        target_vocab: list[str],
+        all_answers: list[str],
+        eval_env: WordleEnv,
+        check_freq: int = 20_000,
+        win_threshold: float = 0.80,
+        n_eval: int = 300,
+        verbose: int = 1,
+    ) -> None:
+        super().__init__(verbose)
+        self.target_vocab = target_vocab   # shared mutable list
+        self.all_answers = all_answers
+        self.eval_env = eval_env
+        self.check_freq = check_freq
+        self.win_threshold = win_threshold
+        self.n_eval = n_eval
+        self._stage = 0
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+        if self._stage >= len(STAGES) - 1:
+            return True
+
+        wins = 0
+        obs, _ = self.eval_env.reset()
+        for _ in range(self.n_eval):
+            done = False
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, _, term, trunc, info = self.eval_env.step(int(action))
+                done = term or trunc
+            if info["won"]:
+                wins += 1
+            obs, _ = self.eval_env.reset()
+
+        win_rate = wins / self.n_eval
+        next_size = STAGES[self._stage + 1]
+        if self.verbose >= 1:
+            print(
+                f"\n[Curriculum] stage={self._stage}  vocab={len(self.target_vocab)}"
+                f"  win_rate={win_rate:.1%}"
+                f"  (need ≥{self.win_threshold:.0%} to advance → {next_size})"
+            )
+
+        if win_rate >= self.win_threshold:
+            self._stage += 1
+            new_words = random.sample(self.all_answers, STAGES[self._stage])
+            self.target_vocab.clear()
+            self.target_vocab.extend(new_words)
+            if self.verbose >= 1:
+                print(f"[Curriculum] → stage {self._stage}: vocab={len(self.target_vocab)}")
+
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
-def train(timesteps: int = 1_000_000, n_envs: int = 8) -> PPO:
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-
-    vec_env = make_vec_env(
-        lambda: WordleEnv(shaped_reward=True),
-        n_envs=n_envs,
-    )
-    vec_env = VecMonitor(vec_env)
-
-    eval_env = make_vec_env(lambda: WordleEnv(shaped_reward=False), n_envs=4)
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=os.path.dirname(MODEL_PATH),
-        log_path=LOG_PATH,
-        eval_freq=max(10_000 // n_envs, 1),
-        n_eval_episodes=200,
-        deterministic=True,
-        verbose=1,
-    )
-
-    model = PPO(
+def _make_model(vec_env, log_path: str) -> PPO:
+    return PPO(
         "MlpPolicy",
         vec_env,
         learning_rate=3e-4,
@@ -61,11 +126,68 @@ def train(timesteps: int = 1_000_000, n_envs: int = 8) -> PPO:
         ent_coef=0.01,
         policy_kwargs=dict(net_arch=[256, 256]),
         verbose=1,
-        tensorboard_log=LOG_PATH,
+        tensorboard_log=log_path,
     )
 
-    print(f"Training PPO for {timesteps:,} timesteps …")
-    model.learn(total_timesteps=timesteps, callback=eval_callback, progress_bar=True)
+
+def train(
+    timesteps: int = 1_000_000,
+    n_envs: int = 8,
+    curriculum: bool = False,
+) -> PPO:
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+
+    all_answers = list(ANSWERS)
+
+    if curriculum:
+        # Shared mutable target pool — all envs reference this exact list
+        target_vocab: list[str] = random.sample(all_answers, STAGES[0])
+        make_env = lambda: WordleEnv(shaped_reward=True, target_vocab=target_vocab)
+        eval_env = WordleEnv(shaped_reward=False, target_vocab=target_vocab)
+    else:
+        target_vocab = all_answers
+        make_env = lambda: WordleEnv(shaped_reward=True)
+        eval_env = WordleEnv(shaped_reward=False)
+
+    vec_env = VecMonitor(make_vec_env(make_env, n_envs=n_envs))
+
+    model = _make_model(vec_env, LOG_PATH)
+
+    callbacks: list = []
+    if curriculum:
+        callbacks.append(
+            CurriculumCallback(
+                target_vocab=target_vocab,
+                all_answers=all_answers,
+                eval_env=eval_env,
+                check_freq=max(20_000 // n_envs, 1),
+                win_threshold=0.80,
+                n_eval=300,
+            )
+        )
+
+    # Standard eval callback (saves best model)
+    sb3_eval = EvalCallback(
+        make_vec_env(lambda: WordleEnv(shaped_reward=False), n_envs=4),
+        best_model_save_path=os.path.dirname(MODEL_PATH),
+        log_path=LOG_PATH,
+        eval_freq=max(50_000 // n_envs, 1),
+        n_eval_episodes=200,
+        deterministic=True,
+        verbose=1,
+    )
+    callbacks.append(sb3_eval)
+
+    mode = "curriculum" if curriculum else "standard"
+    print(f"Training PPO ({mode}) for {timesteps:,} timesteps …")
+    if curriculum:
+        print(f"  Stage 0: {STAGES[0]} target words → full {STAGES[-1]}")
+
+    model.learn(
+        total_timesteps=timesteps,
+        callback=CallbackList(callbacks),
+        progress_bar=True,
+    )
     model.save(MODEL_PATH)
     print(f"Model saved to {MODEL_PATH}.zip")
     return model
@@ -79,32 +201,30 @@ def evaluate(model: PPO, n_games: int = 500) -> dict:
     env = WordleEnv(shaped_reward=False)
     wins = 0
     total_guesses = 0
-    guess_dist: dict[int, int] = {}
+    dist: dict[int, int] = {}
 
+    obs, _ = env.reset()
     for _ in range(n_games):
-        obs, _ = env.reset()
         done = False
-        won = False
-        n = 0
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, _, terminated, truncated, info = env.step(int(action))
-            done = terminated or truncated
-            n = info["n_guesses"]
-            won = info["won"]
+            obs, _, term, trunc, info = env.step(int(action))
+            done = term or trunc
+        n = info["n_guesses"]
+        won = info["won"]
         if won:
             wins += 1
             total_guesses += n
-            guess_dist[n] = guess_dist.get(n, 0) + 1
+            dist[n] = dist.get(n, 0) + 1
         else:
-            guess_dist[7] = guess_dist.get(7, 0) + 1  # failure bucket
+            dist[7] = dist.get(7, 0) + 1
+        obs, _ = env.reset()
 
     win_rate = wins / n_games
-    avg_guesses = total_guesses / max(wins, 1)
     return {
         "win_rate": win_rate,
-        "avg_guesses_on_win": avg_guesses,
-        "distribution": guess_dist,
+        "avg_guesses_on_win": total_guesses / max(wins, 1),
+        "distribution": dist,
         "n_games": n_games,
     }
 
@@ -117,20 +237,25 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timesteps", type=int, default=1_000_000)
     parser.add_argument("--n_envs", type=int, default=8)
-    parser.add_argument("--eval", action="store_true", help="evaluate saved model only")
+    parser.add_argument("--curriculum", action="store_true")
+    parser.add_argument("--eval", action="store_true")
     parser.add_argument("--n_eval", type=int, default=500)
     args = parser.parse_args()
 
     if args.eval:
         path = MODEL_PATH + ".zip"
         if not os.path.exists(path):
-            print(f"No model found at {path}. Train first.")
+            print(f"No model at {path}. Train first.")
             return
         model = PPO.load(MODEL_PATH, env=WordleEnv())
     else:
-        model = train(timesteps=args.timesteps, n_envs=args.n_envs)
+        model = train(
+            timesteps=args.timesteps,
+            n_envs=args.n_envs,
+            curriculum=args.curriculum,
+        )
 
-    print("\nEvaluating …")
+    print("\nEvaluating on full word bank …")
     stats = evaluate(model, n_games=args.n_eval)
     print(f"Win rate      : {stats['win_rate']:.1%}")
     print(f"Avg guesses   : {stats['avg_guesses_on_win']:.2f}  (wins only)")
