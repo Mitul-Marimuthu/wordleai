@@ -110,17 +110,20 @@ class VizCallback(BaseCallback):
 
 # ─── Training thread ─────────────────────────────────────────────────────────
 
-def _train(timesteps: int, n_steps: int, curriculum: bool) -> None:
+def _train(timesteps: int, n_steps: int, curriculum: bool, masked: bool) -> None:
+    from train_rl import _ppo_class
+    PPO = _ppo_class(masked)
+
     all_ans = list(ANSWERS)
 
     if curriculum:
         from train_rl import STAGES, CurriculumCallback
         tv = random.sample(all_ans, STAGES[0])
-        env = WordleEnv(shaped_reward=True, target_vocab=tv)
+        env = WordleEnv(shaped_reward=True, target_vocab=tv, use_mask=masked)
         cur_cb = CurriculumCallback(
             target_vocab=tv,
             all_answers=all_ans,
-            eval_env=WordleEnv(shaped_reward=False, target_vocab=tv),
+            eval_env=WordleEnv(shaped_reward=False, target_vocab=tv, use_mask=masked),
             check_freq=20_000,
             win_threshold=0.80,
             n_eval=200,
@@ -128,7 +131,7 @@ def _train(timesteps: int, n_steps: int, curriculum: bool) -> None:
         )
         cbs: list[BaseCallback] = [VizCallback(), cur_cb]
     else:
-        env = WordleEnv(shaped_reward=True)
+        env = WordleEnv(shaped_reward=True, use_mask=masked)
         cbs = [VizCallback()]
 
     if os.path.exists(MODEL_PATH + ".zip"):
@@ -342,6 +345,8 @@ def main() -> None:
     parser.add_argument("--n_steps",    type=int, default=512,
                         help="PPO rollout length (smaller → more frequent policy updates)")
     parser.add_argument("--curriculum", action="store_true")
+    parser.add_argument("--masked",     action="store_true",
+                        help="Use action masking (MaskablePPO) — much faster convergence")
     args = parser.parse_args()
 
     pygame.init()
@@ -370,7 +375,7 @@ def main() -> None:
 
     t = threading.Thread(
         target=_train,
-        args=(args.timesteps, args.n_steps, args.curriculum),
+        args=(args.timesteps, args.n_steps, args.curriculum, args.masked),
         daemon=True,
     )
     t.start()
