@@ -7,10 +7,11 @@ Usage
   python entropy_viz.py --delay 0.5           # faster
   python entropy_viz.py --word crane          # fix the target word
   python entropy_viz.py --compare             # entropy vs RL side by side
+  python entropy_viz.py --graphs              # live statistics graphs (full speed)
 
 Controls
 --------
-  SPACE / RIGHT  – skip to next game
+  SPACE / RIGHT  – skip to next game  (simulation modes)
   ESC / Q        – quit
 """
 
@@ -355,6 +356,179 @@ def _drain(q, state):
         pass
 
 
+# ─── Graph-mode state & helpers ───────────────────────────────────────────────
+
+def _blank_graph_state() -> dict:
+    return {
+        "game_num": 0,
+        "wins":     0,
+        "rolling":  deque(maxlen=50),
+        "wins_series": [],   # [(game_num, cumulative_wins)]
+        "avg_series":  [],   # [(game_num, rolling_avg)]
+        "no_model": False,
+    }
+
+
+def _apply_graph_msg(gst: dict, msg: dict) -> None:
+    t = msg["type"]
+    if t == "end":
+        gst["game_num"] += 1
+        won = msg["won"]
+        n   = msg["n"]
+        if won:
+            gst["wins"] += 1
+        gst["rolling"].append(n if won else MAX_GUESSES + 1)
+        avg = sum(gst["rolling"]) / len(gst["rolling"])
+        gst["wins_series"].append((gst["game_num"], gst["wins"]))
+        gst["avg_series"].append((gst["game_num"], avg))
+    elif t == "no_model":
+        gst["no_model"] = True
+
+
+def _drain_graph(q: queue.Queue, gst: dict) -> None:
+    try:
+        while True:
+            _apply_graph_msg(gst, q.get_nowait())
+    except queue.Empty:
+        pass
+
+
+def _subsample(pts: list, max_pts: int = 800) -> list:
+    """Thin a point list to at most max_pts evenly-spaced entries."""
+    n = len(pts)
+    if n <= max_pts:
+        return pts
+    idxs = [int(i * (n - 1) / (max_pts - 1)) for i in range(max_pts)]
+    return [pts[i] for i in idxs]
+
+
+def draw_line_chart(
+    surf,
+    font_md,
+    font_sm,
+    title: str,
+    y_min: float,
+    y_max: float,
+    y_ticks: list,
+    series: list,          # [(label, color, [(x, y), ...])]
+    gx: int, gy: int, gw: int, gh: int,
+    x_max: int | None = None,
+    ref_lines: list | None = None,  # [(y_val, color, label)]
+) -> None:
+    """Render a multi-series line chart inside (gx, gy, gw, gh)."""
+
+    pygame.draw.rect(surf, C["panel"], (gx, gy, gw, gh), border_radius=6)
+
+    # title
+    ts = font_md.render(title, True, C["title"])
+    surf.blit(ts, (gx + 10, gy + 8))
+
+    # legend (top-right, right-to-left)
+    lx = gx + gw - 12
+    for lbl, col, _ in reversed(series):
+        ls = font_sm.render(lbl, True, col)
+        lx -= ls.get_width()
+        surf.blit(ls, (lx, gy + 10))
+        pygame.draw.line(surf, col, (lx - 22, gy + 17), (lx - 5, gy + 17), 2)
+        lx -= 30
+
+    # inner plot margins
+    IX = gx + 58
+    IY = gy + 34
+    IW = gw - 70
+    IH = gh - 52
+
+    pygame.draw.rect(surf, (22, 22, 24), (IX, IY, IW, IH))
+
+    # determine x range
+    all_xs = [x for _, _, pts in series for x, _ in pts]
+    if not all_xs and x_max is None:
+        msg = font_md.render("Waiting for data …", True, C["dim"])
+        surf.blit(msg, msg.get_rect(centerx=IX + IW // 2, centery=IY + IH // 2))
+        pygame.draw.rect(surf, C["border"], (IX, IY, IW, IH), 1)
+        return
+
+    xmax = x_max if x_max is not None else (max(all_xs) if all_xs else 1)
+    xmax = max(xmax, 1)
+
+    def sx(x: float) -> int:
+        return IX + int(x / xmax * IW)
+
+    def sy(y: float) -> int:
+        span = y_max - y_min
+        if span == 0:
+            return IY + IH // 2
+        return IY + IH - int((y - y_min) / span * IH)
+
+    # y grid + labels
+    for tick in y_ticks:
+        ty = sy(tick)
+        if IY - 1 <= ty <= IY + IH + 1:
+            pygame.draw.line(surf, (38, 38, 42), (IX, ty), (IX + IW, ty), 1)
+            tl = font_sm.render(
+                f"{tick:.0%}" if y_max <= 1.0 else str(tick),
+                True, C["dim"],
+            )
+            surf.blit(tl, (IX - tl.get_width() - 5, ty - tl.get_height() // 2))
+
+    # x grid + labels (5 ticks)
+    n_xticks = 5
+    x_step   = max(1, xmax // n_xticks)
+    for xi in range(0, int(xmax) + 1, x_step):
+        tx = sx(xi)
+        pygame.draw.line(surf, (38, 38, 42), (tx, IY), (tx, IY + IH), 1)
+        xl = font_sm.render(str(xi), True, C["dim"])
+        surf.blit(xl, (tx - xl.get_width() // 2, IY + IH + 4))
+
+    # x-axis label
+    xl_lbl = font_sm.render("games played", True, C["dim"])
+    surf.blit(xl_lbl, (IX + IW - xl_lbl.get_width(), IY + IH + 4))
+
+    # reference lines (dashed-ish via short segments)
+    for y_val, col, rlbl in (ref_lines or []):
+        ry = sy(y_val)
+        if IY <= ry <= IY + IH:
+            for dx in range(0, IW, 12):
+                pygame.draw.line(surf, col,
+                                 (IX + dx, ry),
+                                 (IX + min(dx + 7, IW), ry), 1)
+            rls = font_sm.render(rlbl, True, col)
+            surf.blit(rls, (IX + 6, ry - rls.get_height() - 2))
+
+    # data series
+    for lbl, col, pts in series:
+        pts = _subsample(pts)
+        if len(pts) < 2:
+            continue
+        screen_pts = [
+            (max(IX, min(IX + IW, sx(x))),
+             max(IY, min(IY + IH, sy(y))))
+            for x, y in pts
+        ]
+        pygame.draw.lines(surf, col, False, screen_pts, 2)
+
+    pygame.draw.rect(surf, C["border"], (IX, IY, IW, IH), 1)
+
+
+def draw_graph_statusbar(surf, font_md, w, h,
+                          e_games, e_wins, r_games, r_wins) -> None:
+    sy = h - STATUS_H
+    pygame.draw.rect(surf, C["panel"], (0, sy, w, STATUS_H))
+    pygame.draw.line(surf, C["border"], (0, sy), (w, sy), 1)
+
+    items = [
+        ("GRAPHS  mode  —  full speed", C["title"]),
+        (f"Entropy  {e_games:,} games  {e_wins/max(e_games,1):.1%} win",  C["rem"]),
+        (f"RL Agent  {r_games:,} games  {r_wins/max(r_games,1):.1%} win", C["rl_col"]),
+        ("ESC  quit", C["dim"]),
+    ]
+    x = 20
+    for txt, col in items:
+        s = font_md.render(txt, True, col)
+        surf.blit(s, (x, sy + (STATUS_H - s.get_height()) // 2))
+        x += s.get_width() + 40
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -362,38 +536,48 @@ def main() -> None:
     parser.add_argument("--delay",   type=float, default=1.0)
     parser.add_argument("--word",    default=None)
     parser.add_argument("--compare", action="store_true",
-                        help="Show entropy solver and RL agent side by side")
+                        help="Entropy vs RL side-by-side boards + per-model bar charts")
+    parser.add_argument("--graphs",  action="store_true",
+                        help="Live stats graphs: wins over time + avg guesses (full speed, no boards)")
     args = parser.parse_args()
 
-    compare = args.compare
-    W = W_C if compare else W_S
-    H = H_C if compare else H_S
+    graphs  = args.graphs
+    compare = args.compare and not graphs   # --graphs takes priority
+
+    W = 1060 if graphs else (W_C if compare else W_S)
+    H = 700  if graphs else (H_C if compare else H_S)
 
     pygame.init()
     screen = pygame.display.set_mode((W, H))
     pygame.display.set_caption(
-        "Entropy Solver vs RL Agent" if compare else "Entropy Solver — live"
+        "Wordle — Statistics Graphs" if graphs else
+        "Entropy Solver vs RL Agent" if compare else
+        "Entropy Solver — live"
     )
     clock = pygame.time.Clock()
 
     try:
         font_lg = pygame.font.SysFont("Helvetica Neue", 28 if compare else 30, bold=True)
-        font_md = pygame.font.SysFont("Helvetica Neue", 16 if compare else 17)
-        font_sm = pygame.font.SysFont("Helvetica Neue", 12 if compare else 13)
+        font_md = pygame.font.SysFont("Helvetica Neue", 16)
+        font_sm = pygame.font.SysFont("Helvetica Neue", 12)
     except Exception:
         font_lg = pygame.font.Font(None, 32 if compare else 34)
-        font_md = pygame.font.Font(None, 19 if compare else 20)
-        font_sm = pygame.font.Font(None, 15 if compare else 16)
+        font_md = pygame.font.Font(None, 19)
+        font_sm = pygame.font.Font(None, 15)
 
+    # ── Launch solver threads ──────────────────────────────────────────────
+    delay = 0.0 if graphs else args.delay
+    threading.Thread(target=_entropy_loop, args=(delay, args.word),
+                     daemon=True).start()
+    if compare or graphs:
+        threading.Thread(target=_rl_loop, args=(delay, args.word),
+                         daemon=True).start()
+
+    # ── Per-mode state ─────────────────────────────────────────────────────
     entropy_state = _blank_state()
     rl_state      = _blank_state()
-
-    # Launch threads
-    threading.Thread(target=_entropy_loop, args=(args.delay, args.word),
-                     daemon=True).start()
-    if compare:
-        threading.Thread(target=_rl_loop, args=(args.delay, args.word),
-                         daemon=True).start()
+    entropy_gst   = _blank_graph_state()
+    rl_gst        = _blank_graph_state()
 
     running = True
     while running:
@@ -403,19 +587,74 @@ def main() -> None:
             if event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
-                if event.key in (pygame.K_SPACE, pygame.K_RIGHT):
+                if event.key in (pygame.K_SPACE, pygame.K_RIGHT) and not graphs:
                     _skip.set()
-
-        _drain(_entropy_q, entropy_state)
-        if compare:
-            _drain(_rl_q, rl_state)
 
         screen.fill(C["bg"])
 
-        if compare:
+        # ── GRAPHS MODE ───────────────────────────────────────────────────
+        if graphs:
+            _drain_graph(_entropy_q, entropy_gst)
+            _drain_graph(_rl_q, rl_gst)
+
+            eg = entropy_gst
+            rg = rl_gst
+
+            # shared x_max so both lines are on the same scale
+            x_max = max(eg["game_num"], rg["game_num"], 1)
+
+            PAD  = 20
+            MIDH = (H - STATUS_H) // 2
+
+            # ── Graph 1: Games Won vs Games Played ────────────────────────
+            y_max_wins = x_max
+            n_ticks    = 6
+            tick_step  = max(1, y_max_wins // n_ticks)
+            y_ticks_w  = list(range(0, y_max_wins + tick_step, tick_step))
+
+            draw_line_chart(
+                screen, font_md, font_sm,
+                title    = "Games Won vs Games Played",
+                y_min    = 0,
+                y_max    = max(y_max_wins, 1),
+                y_ticks  = y_ticks_w,
+                series   = [
+                    ("Entropy Solver", C["rem"],    eg["wins_series"]),
+                    ("RL Agent",       C["rl_col"], rg["wins_series"]),
+                ],
+                gx=PAD, gy=PAD,
+                gw=W - 2*PAD, gh=MIDH - PAD,
+                x_max=x_max,
+                ref_lines=None,
+            )
+
+            # ── Graph 2: Rolling Average Guesses ──────────────────────────
+            draw_line_chart(
+                screen, font_md, font_sm,
+                title    = "Rolling Average Guesses per Game  (window 50,  7 = fail)",
+                y_min    = 1.0,
+                y_max    = 7.0,
+                y_ticks  = [1, 2, 3, 4, 5, 6, 7],
+                series   = [
+                    ("Entropy Solver", C["rem"],    eg["avg_series"]),
+                    ("RL Agent",       C["rl_col"], rg["avg_series"]),
+                ],
+                gx=PAD, gy=MIDH + PAD,
+                gw=W - 2*PAD, gh=MIDH - PAD,
+                x_max=x_max,
+                ref_lines=[(3.5, C["avg_ln"], "entropy benchmark ≈ 3.5")],
+            )
+
+            draw_graph_statusbar(screen, font_md, W, H,
+                                 eg["game_num"], eg["wins"],
+                                 rg["game_num"], rg["wins"])
+
+        # ── COMPARE MODE ──────────────────────────────────────────────────
+        elif compare:
+            _drain(_entropy_q, entropy_state)
+            _drain(_rl_q, rl_state)
             cell, gap = CELL_C, GAP_C
 
-            # Left panel — entropy
             draw_board(screen, font_lg, font_md,
                        entropy_state["game"], entropy_state["game_num"],
                        entropy_state["target"], entropy_state["remaining"],
@@ -423,18 +662,15 @@ def main() -> None:
                        px=0, pw=PANEL_W, cell=cell, gap=gap,
                        area_h=BOARD_AREA_H,
                        label="ENTROPY  SOLVER", label_color=C["rem"])
-
             draw_graph(screen, font_md, font_sm,
                        list(entropy_state["hist"]), entropy_state["avg"],
                        entropy_state["game_num"], entropy_state["wins"],
                        px=0, py=BOARD_AREA_H, pw=PANEL_W, ph=GRAPH_AREA_H,
                        label_color=C["rem"])
 
-            # Vertical divider
             pygame.draw.line(screen, C["divider"],
                              (PANEL_W, 0), (PANEL_W, H - STATUS_H), 1)
 
-            # Right panel — RL agent
             if rl_state["no_model"]:
                 msg = font_md.render(
                     "No trained model found.  Run train_rl.py first.", True, C["dim"])
@@ -448,19 +684,18 @@ def main() -> None:
                            px=PANEL_W, pw=PANEL_W, cell=cell, gap=gap,
                            area_h=BOARD_AREA_H,
                            label="RL  AGENT  (PPO)", label_color=C["rl_col"])
-
                 draw_graph(screen, font_md, font_sm,
                            list(rl_state["hist"]), rl_state["avg"],
                            rl_state["game_num"], rl_state["wins"],
                            px=PANEL_W, py=BOARD_AREA_H,
                            pw=PANEL_W, ph=GRAPH_AREA_H,
                            label_color=C["rl_col"])
+            draw_statusbar(screen, font_md, W, H, args.delay, compare)
 
+        # ── SINGLE MODE ───────────────────────────────────────────────────
         else:
-            # ── Single mode (original layout) ─────────────────────────────
+            _drain(_entropy_q, entropy_state)
             cell, gap = CELL_S, GAP_S
-
-            # Board fills left panel
             draw_board(screen, font_lg, font_md,
                        entropy_state["game"], entropy_state["game_num"],
                        entropy_state["target"], entropy_state["remaining"],
@@ -468,16 +703,14 @@ def main() -> None:
                        px=0, pw=DIVIDER_S, cell=cell, gap=gap,
                        area_h=H - STATUS_H,
                        label="ENTROPY  SOLVER", label_color=C["rem"])
-
-            # Graph fills right panel
             draw_graph(screen, font_md, font_sm,
                        list(entropy_state["hist"]), entropy_state["avg"],
                        entropy_state["game_num"], entropy_state["wins"],
                        px=DIVIDER_S, py=0,
                        pw=W - DIVIDER_S, ph=H - STATUS_H,
                        label_color=C["rem"])
+            draw_statusbar(screen, font_md, W, H, args.delay, compare)
 
-        draw_statusbar(screen, font_md, W, H, args.delay, compare)
         pygame.display.flip()
         clock.tick(30)
 
