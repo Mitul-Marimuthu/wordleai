@@ -36,6 +36,12 @@ _entropy_q: "queue.Queue[dict]" = queue.Queue(maxsize=300)
 _rl_q:      "queue.Queue[dict]" = queue.Queue(maxsize=300)
 _skip = threading.Event()
 
+# Coordinator sync primitives (used by --compare / --graphs)
+_entropy_target_q: "queue.Queue[str]" = queue.Queue(maxsize=1)
+_rl_target_q:      "queue.Queue[str]" = queue.Queue(maxsize=1)
+_entropy_done_ev = threading.Event()
+_rl_done_ev      = threading.Event()
+
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "ppo_wordle")
 
 # ─── Solver threads ──────────────────────────────────────────────────────────
@@ -126,6 +132,104 @@ def _rl_loop(delay: float, fixed_word: str | None) -> None:
                    "n": len(game), "won": won})
         _skip.clear()
         time.sleep(delay)
+
+
+# ─── Synced loops + coordinator (used when both agents run together) ──────────
+#
+# The coordinator picks a target and hands it to both agents via their own
+# target queues, then blocks until BOTH signal completion before issuing the
+# next game.  This keeps the game counts identical on the X axis at all times.
+
+def _entropy_loop_synced(delay: float) -> None:
+    solver = EntropySolver(cache=True)
+    while True:
+        target = _entropy_target_q.get()          # wait for coordinator
+        solver.reset()
+        game: list[tuple[str, str]] = []
+        _entropy_q.put({"type": "new_game"})
+
+        for _ in range(MAX_GUESSES):
+            if _skip.is_set():
+                break
+            guess = solver.best_guess()
+            time.sleep(delay)
+            if _skip.is_set():
+                break
+            pattern = evaluate_guess(guess, target)
+            game.append((guess, pattern))
+            solver.update(guess, pattern)
+            _entropy_q.put({"type": "step", "game": list(game),
+                            "remaining": solver.n_possible})
+            if pattern == WIN_PATTERN:
+                break
+
+        won = bool(game) and game[-1][1] == WIN_PATTERN
+        _entropy_q.put({"type": "end", "target": target, "n": len(game), "won": won})
+        _entropy_done_ev.set()                    # tell coordinator we're done
+
+
+def _rl_loop_synced(delay: float) -> None:
+    result = _load_rl_model()
+    if result is None:
+        _rl_q.put({"type": "no_model"})
+        # Consume targets and immediately signal done so the coordinator
+        # never blocks waiting for us.
+        while True:
+            _rl_target_q.get()
+            _rl_done_ev.set()
+        return
+    model, masked = result
+
+    while True:
+        target = _rl_target_q.get()              # wait for coordinator
+        env = WordleEnv(shaped_reward=False, use_mask=masked)
+        obs, _ = env.reset()
+        env._target = target
+        if masked and env._possible is not None:
+            env._possible[:] = True
+
+        game: list[tuple[str, str]] = []
+        _rl_q.put({"type": "new_game"})
+
+        done = False
+        while not done:
+            if _skip.is_set():
+                break
+            time.sleep(delay)
+            if _skip.is_set():
+                break
+            kwargs = {"action_masks": env.action_masks()} if masked else {}
+            action, _ = model.predict(obs, deterministic=True, **kwargs)
+            obs, _, term, trunc, info = env.step(int(action))
+            done = term or trunc
+            game.append((info["guess"], info["pattern"]))
+            _rl_q.put({"type": "step", "game": list(game), "remaining": None})
+
+        won = bool(game) and game[-1][1] == WIN_PATTERN
+        _rl_q.put({"type": "end", "target": target, "n": len(game), "won": won})
+        _rl_done_ev.set()                         # tell coordinator we're done
+
+
+def _coordinator(fixed_word: str | None, with_rl: bool) -> None:
+    """Issue one shared target per game; wait for all agents to finish first."""
+    rng = random.Random()
+    while True:
+        target = fixed_word if fixed_word else rng.choice(ANSWERS)
+
+        _entropy_done_ev.clear()
+        if with_rl:
+            _rl_done_ev.clear()
+
+        _entropy_target_q.put(target)
+        if with_rl:
+            _rl_target_q.put(target)
+
+        # Block until every agent has sent its "end" message
+        _entropy_done_ev.wait()
+        if with_rl:
+            _rl_done_ev.wait()
+
+        _skip.clear()   # safe to clear once both are between games
 
 
 # ─── Colours ─────────────────────────────────────────────────────────────────
@@ -566,12 +670,21 @@ def main() -> None:
         font_sm = pygame.font.Font(None, 15)
 
     # ── Launch solver threads ──────────────────────────────────────────────
-    delay = 0.0 if graphs else args.delay
-    threading.Thread(target=_entropy_loop, args=(delay, args.word),
-                     daemon=True).start()
-    if compare or graphs:
-        threading.Thread(target=_rl_loop, args=(delay, args.word),
-                         daemon=True).start()
+    delay    = 0.0 if graphs else args.delay
+    with_rl  = compare or graphs
+
+    if with_rl:
+        # Coordinator keeps both agents on the same game number
+        threading.Thread(target=_coordinator,
+                         args=(args.word, True), daemon=True).start()
+        threading.Thread(target=_entropy_loop_synced,
+                         args=(delay,), daemon=True).start()
+        threading.Thread(target=_rl_loop_synced,
+                         args=(delay,), daemon=True).start()
+    else:
+        # Single-agent mode: entropy picks its own targets
+        threading.Thread(target=_entropy_loop,
+                         args=(delay, args.word), daemon=True).start()
 
     # ── Per-mode state ─────────────────────────────────────────────────────
     entropy_state = _blank_state()
