@@ -46,7 +46,21 @@ _slow = threading.Event()   # set once rolling avg ≤ SLOW_THRESHOLD
 
 ROLLING_WIN    = 50          # window for rolling average
 SLOW_THRESHOLD = 6.0         # trigger slow mode when avg ≤ this
-GUESS_DELAY    = 1.0         # seconds per guess in slow mode
+GUESS_DELAY    = 1.0         # default delay (s) when slow mode auto-triggers
+
+# Mutable delay shared between threads — list so assignment is GIL-atomic.
+# Training thread reads _delay[0]; pygame thread writes it via _change_delay().
+_delay: list[float] = [0.0]
+
+DELAY_STEP = 0.25
+DELAY_MAX  = 5.0
+
+# Button rects populated each frame by draw_stats(), read in the event loop.
+_btn: dict[str, pygame.Rect] = {}
+
+
+def _change_delay(delta: float) -> None:
+    _delay[0] = round(max(0.0, min(DELAY_MAX, _delay[0] + delta)), 2)
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "ppo_wordle")
@@ -95,15 +109,16 @@ class VizCallback(BaseCallback):
                 "hist": list(self._hist),
             })
 
-            # engage slow mode once agent starts solving games
+            # auto-engage delay once agent starts solving games
             if not _slow.is_set() and avg <= SLOW_THRESHOLD:
                 _slow.set()
-                print(f"[viz] Rolling avg {avg:.2f} ≤ {SLOW_THRESHOLD} → SLOW mode")
+                _delay[0] = GUESS_DELAY
+                print(f"[viz] Rolling avg {avg:.2f} ≤ {SLOW_THRESHOLD} → delay {GUESS_DELAY}s")
 
             self._game = []
 
-        if _slow.is_set():
-            time.sleep(GUESS_DELAY)
+        if _delay[0] > 0:
+            time.sleep(_delay[0])
 
         return True
 
@@ -322,19 +337,21 @@ def draw_stats(surf: pygame.Surface,
                font_md: pygame.font.Font,
                ep_num: int,
                avg: float,
-               slow: bool,
                done: bool) -> None:
 
-    sy = H - 56
+    sy  = H - 56
+    cy  = sy + 28   # vertical centre of stats bar
     pygame.draw.rect(surf, C["panel"], (0, sy, W, 56))
     pygame.draw.line(surf, C["border"], (0, sy), (W, sy), 1)
 
+    # ── left side: status labels ───────────────────────────────────────
+    d = _delay[0]
+    slow_active = d > 0
     items = [
-        (f"{'● SLOW MODE  1s/guess' if slow else '● FAST MODE  no delay'}",
-         C["slow_on"] if slow else C["slow_off"]),
+        (f"{'● SLOW' if slow_active else '● FAST'}  {d:.2f}s/guess",
+         C["slow_on"] if slow_active else C["slow_off"]),
         (f"episode  {ep_num:,}", C["text"]),
-        (f"rolling avg  {avg:.2f} / {SLOW_THRESHOLD:.0f}  {'(threshold)' if not slow else ''}",
-         C["avg_line"] if slow else C["dim"]),
+        (f"rolling avg  {avg:.2f} / {SLOW_THRESHOLD:.0f}", C["avg_line"] if slow_active else C["dim"]),
     ]
     if done:
         items.append(("training complete", C["correct"]))
@@ -344,6 +361,33 @@ def draw_stats(surf: pygame.Surface,
         s = font_md.render(txt, True, col)
         surf.blit(s, (x, sy + (56 - s.get_height()) // 2))
         x += s.get_width() + 40
+
+    # ── right side: speed adjuster  [−]  0.00s  [+] ───────────────────
+    btn_w, btn_h = 26, 26
+    btn_y = cy - btn_h // 2
+
+    # [+]
+    plus_rect = pygame.Rect(W - 20 - btn_w, btn_y, btn_w, btn_h)
+    pygame.draw.rect(surf, C["border"], plus_rect, border_radius=4)
+    ps = font_md.render("+", True, C["text"])
+    surf.blit(ps, ps.get_rect(center=plus_rect.center))
+    _btn["speed_up"] = plus_rect
+
+    # delay value
+    val_s = font_md.render(f"{d:.2f}s", True, C["avg_line"])
+    val_x = plus_rect.left - val_s.get_width() - 8
+    surf.blit(val_s, (val_x, cy - val_s.get_height() // 2))
+
+    # [−]
+    minus_rect = pygame.Rect(val_x - 8 - btn_w, btn_y, btn_w, btn_h)
+    pygame.draw.rect(surf, C["border"], minus_rect, border_radius=4)
+    ms = font_md.render("−", True, C["text"])   # − (minus sign)
+    surf.blit(ms, ms.get_rect(center=minus_rect.center))
+    _btn["speed_down"] = minus_rect
+
+    # "speed" label
+    spd = font_md.render("speed", True, C["dim"])
+    surf.blit(spd, (minus_rect.left - spd.get_width() - 10, cy - spd.get_height() // 2))
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -396,8 +440,22 @@ def main() -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                running = False
+
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                # +/= or numpad + → speed up (increase delay)
+                elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                    _change_delay(DELAY_STEP)
+                # - or numpad - → speed down (decrease delay)
+                elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    _change_delay(-DELAY_STEP)
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if _btn.get("speed_up") and _btn["speed_up"].collidepoint(event.pos):
+                    _change_delay(DELAY_STEP)
+                elif _btn.get("speed_down") and _btn["speed_down"].collidepoint(event.pos):
+                    _change_delay(-DELAY_STEP)
 
         # drain the queue (non-blocking)
         try:
@@ -420,7 +478,7 @@ def main() -> None:
                    state["game"], state["ep"], state["last_won"])
         draw_graph(screen, font_md, font_sm, state["hist"], state["avg"])
         draw_stats(screen, font_md,
-                   state["ep"], state["avg"], _slow.is_set(), state["done"])
+                   state["ep"], state["avg"], state["done"])
 
         pygame.display.flip()
         clock.tick(30)
