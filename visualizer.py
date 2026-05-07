@@ -162,6 +162,12 @@ def _train(timesteps: int, n_steps: int, curriculum: bool, masked: bool, top_k: 
         print("[viz] Resuming from existing model …")
         model = PPO.load(MODEL_PATH, env=env)
         model.set_env(env)
+        # Fine-tuning: 10× lower LR to preserve BC-learned weights
+        model.learning_rate = 3e-5
+        model.ent_coef = 0.003
+        for pg in model.policy.optimizer.param_groups:
+            pg["lr"] = 3e-5
+        print("[viz] Fine-tune settings: lr=3e-5  ent_coef=0.003")
     else:
         model = PPO(
             "MlpPolicy", env,
