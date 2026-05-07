@@ -158,6 +158,7 @@ def train(
     n_envs: int = 8,
     curriculum: bool = False,
     masked: bool = False,
+    dense_reward: bool = True,
 ) -> object:
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 
@@ -165,12 +166,12 @@ def train(
 
     if curriculum:
         target_vocab: list[str] = random.sample(all_answers, STAGES[0])
-        make_env  = lambda: WordleEnv(shaped_reward=True,  target_vocab=target_vocab, use_mask=masked)
-        eval_env  = WordleEnv(shaped_reward=False, target_vocab=target_vocab, use_mask=masked)
+        make_env  = lambda: WordleEnv(shaped_reward=True,  dense_reward=dense_reward, target_vocab=target_vocab, use_mask=masked)
+        eval_env  = WordleEnv(shaped_reward=False, dense_reward=False, target_vocab=target_vocab, use_mask=masked)
     else:
         target_vocab = all_answers
-        make_env  = lambda: WordleEnv(shaped_reward=True,  use_mask=masked)
-        eval_env  = WordleEnv(shaped_reward=False, use_mask=masked)
+        make_env  = lambda: WordleEnv(shaped_reward=True,  dense_reward=dense_reward, use_mask=masked)
+        eval_env  = WordleEnv(shaped_reward=False, dense_reward=False, use_mask=masked)
 
     vec_env = VecMonitor(make_vec_env(make_env, n_envs=n_envs))
     model   = _make_model(vec_env, LOG_PATH, masked)
@@ -260,12 +261,14 @@ def evaluate(model, n_games: int = 500, masked: bool = False) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--timesteps", type=int, default=1_000_000)
-    parser.add_argument("--n_envs", type=int, default=8)
-    parser.add_argument("--curriculum", action="store_true")
-    parser.add_argument("--masked",     action="store_true")
-    parser.add_argument("--eval",       action="store_true")
-    parser.add_argument("--n_eval",     type=int, default=500)
+    parser.add_argument("--timesteps",       type=int, default=1_000_000)
+    parser.add_argument("--n_envs",          type=int, default=8)
+    parser.add_argument("--curriculum",      action="store_true")
+    parser.add_argument("--masked",          action="store_true")
+    parser.add_argument("--no_dense_reward", action="store_true",
+                        help="Disable per-step dense reward (terminal rewards only)")
+    parser.add_argument("--eval",            action="store_true")
+    parser.add_argument("--n_eval",          type=int, default=500)
     args = parser.parse_args()
 
     if args.eval:
@@ -281,6 +284,7 @@ def main() -> None:
             n_envs=args.n_envs,
             curriculum=args.curriculum,
             masked=args.masked,
+            dense_reward=not args.no_dense_reward,
         )
 
     print("\nEvaluating on full word bank …")
