@@ -337,6 +337,7 @@ def draw_stats(surf: pygame.Surface,
                font_md: pygame.font.Font,
                ep_num: int,
                avg: float,
+               win_rate: float,
                done: bool) -> None:
 
     sy  = H - 56
@@ -347,11 +348,13 @@ def draw_stats(surf: pygame.Surface,
     # ── left side: status labels ───────────────────────────────────────
     d = _delay[0]
     slow_active = d > 0
+    wr_col = C["correct"] if win_rate >= 0.8 else C["avg_line"] if win_rate >= 0.5 else C["dim"]
     items = [
         (f"{'● SLOW' if slow_active else '● FAST'}  {d:.2f}s/guess",
          C["slow_on"] if slow_active else C["slow_off"]),
         (f"episode  {ep_num:,}", C["text"]),
         (f"rolling avg  {avg:.2f} / {SLOW_THRESHOLD:.0f}", C["avg_line"] if slow_active else C["dim"]),
+        (f"win rate  {win_rate:.1%}", wr_col),
     ]
     if done:
         items.append(("training complete", C["correct"]))
@@ -473,12 +476,15 @@ def main() -> None:
         except queue.Empty:
             pass
 
+        hist = state["hist"]
+        win_rate = sum(1 for h in hist if h["won"]) / len(hist) if hist else 0.0
+
         screen.fill(C["bg"])
         draw_board(screen, font_lg, font_md,
                    state["game"], state["ep"], state["last_won"])
-        draw_graph(screen, font_md, font_sm, state["hist"], state["avg"])
+        draw_graph(screen, font_md, font_sm, hist, state["avg"])
         draw_stats(screen, font_md,
-                   state["ep"], state["avg"], state["done"])
+                   state["ep"], state["avg"], win_rate, state["done"])
 
         pygame.display.flip()
         clock.tick(30)
