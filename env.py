@@ -112,22 +112,30 @@ class WordleEnv(gym.Env):
         self._possible: np.ndarray = np.ones(len(self.action_words), dtype=bool)
 
         # Load pattern cache for fast O(1) mask/dense-reward updates.
+        # Cache columns are ordered as ANSWERS (full 2315).  We need columns
+        # corresponding to self.action_words so _mask_matrix rows align with _possible.
         mat, w2r = _load_pattern_cache()
         if mat is not None and w2r is not None:
-            rows = []
-            for w in self.action_words:
-                r = w2r.get(w)
-                if r is not None:
-                    rows.append(mat[r])
-                else:
-                    rows.append(
-                        np.array(
+            _full_col = {w: i for i, w in enumerate(ANSWERS)}
+            col_indices = np.array(
+                [_full_col[w] for w in self.action_words if w in _full_col],
+                dtype=np.intp,
+            )
+            if len(col_indices) == len(self.action_words):
+                rows = []
+                for w in self.action_words:
+                    r = w2r.get(w)
+                    if r is not None:
+                        rows.append(mat[r][col_indices])
+                    else:
+                        rows.append(np.array(
                             [_pattern_str_to_int(evaluate_guess(w, t))
-                             for t in self.answers],
+                             for t in self.action_words],
                             dtype=np.uint8,
-                        )
-                    )
-            self._mask_matrix: np.ndarray | None = np.array(rows, dtype=np.uint8)
+                        ))
+                self._mask_matrix: np.ndarray | None = np.array(rows, dtype=np.uint8)
+            else:
+                self._mask_matrix = None   # action_words not a subset of ANSWERS
         else:
             self._mask_matrix = None
 

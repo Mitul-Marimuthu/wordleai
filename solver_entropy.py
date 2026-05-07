@@ -81,6 +81,25 @@ def _row_entropy(pattern_row: np.ndarray, col_mask: np.ndarray) -> float:
 # Solver
 # ---------------------------------------------------------------------------
 
+def top_entropy_answers(k: int) -> list[str]:
+    """Return the k ANSWERS words with the highest first-guess entropy.
+
+    These are good probe words and can serve as a reduced action+target space
+    for RL training, making exploration tractable without action masking.
+    """
+    solver = EntropySolver()
+    full_mask = np.ones(len(solver.answers), dtype=bool)
+    scored = [
+        (word, _row_entropy(solver._matrix[solver._gue_idx[word]], full_mask))
+        for word in solver.answers
+        if word in solver._gue_idx
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    words = [w for w, _ in scored[: min(k, len(scored))]]
+    print(f"[top_k] top-{len(words)} answers by entropy: {words[:5]} …")
+    return words
+
+
 class EntropySolver:
     """
     Parameters

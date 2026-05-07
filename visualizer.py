@@ -110,28 +110,37 @@ class VizCallback(BaseCallback):
 
 # ─── Training thread ─────────────────────────────────────────────────────────
 
-def _train(timesteps: int, n_steps: int, curriculum: bool, masked: bool) -> None:
-    from train_rl import _ppo_class
+def _train(timesteps: int, n_steps: int, curriculum: bool, masked: bool, top_k: int) -> None:
+    from train_rl import _ppo_class, _active_stages
     PPO = _ppo_class(masked)
 
-    all_ans = list(ANSWERS)
+    if top_k > 0:
+        from solver_entropy import top_entropy_answers
+        all_ans = top_entropy_answers(top_k)
+        env_kw  = dict(answers=all_ans, action_words=all_ans)
+    else:
+        all_ans = list(ANSWERS)
+        env_kw  = {}
+
+    stages = _active_stages(len(all_ans))
 
     if curriculum:
-        from train_rl import STAGES, CurriculumCallback
-        tv = random.sample(all_ans, STAGES[0])
-        env = WordleEnv(shaped_reward=True, target_vocab=tv, use_mask=masked)
+        from train_rl import CurriculumCallback
+        tv = random.sample(all_ans, stages[0])
+        env = WordleEnv(shaped_reward=True, target_vocab=tv, use_mask=masked, **env_kw)
         cur_cb = CurriculumCallback(
             target_vocab=tv,
             all_answers=all_ans,
-            eval_env=WordleEnv(shaped_reward=False, target_vocab=tv, use_mask=masked),
+            eval_env=WordleEnv(shaped_reward=False, target_vocab=tv, use_mask=masked, **env_kw),
             check_freq=20_000,
             win_threshold=0.80,
             n_eval=200,
+            stages=stages,
             verbose=1,
         )
         cbs: list[BaseCallback] = [VizCallback(), cur_cb]
     else:
-        env = WordleEnv(shaped_reward=True, use_mask=masked)
+        env = WordleEnv(shaped_reward=True, use_mask=masked, **env_kw)
         cbs = [VizCallback()]
 
     if os.path.exists(MODEL_PATH + ".zip"):
@@ -347,6 +356,8 @@ def main() -> None:
     parser.add_argument("--curriculum", action="store_true")
     parser.add_argument("--masked",     action="store_true",
                         help="Use action masking (MaskablePPO) — much faster convergence")
+    parser.add_argument("--top_k",      type=int, default=0,
+                        help="Restrict action+target space to top-K entropy answers (0=all 2315)")
     args = parser.parse_args()
 
     pygame.init()
@@ -375,7 +386,7 @@ def main() -> None:
 
     t = threading.Thread(
         target=_train,
-        args=(args.timesteps, args.n_steps, args.curriculum, args.masked),
+        args=(args.timesteps, args.n_steps, args.curriculum, args.masked, args.top_k),
         daemon=True,
     )
     t.start()

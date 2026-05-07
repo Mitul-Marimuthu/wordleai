@@ -80,6 +80,7 @@ class CurriculumCallback(BaseCallback):
         check_freq: int = 20_000,
         win_threshold: float = 0.80,
         n_eval: int = 300,
+        stages: list[int] | None = None,
         verbose: int = 1,
     ) -> None:
         super().__init__(verbose)
@@ -89,12 +90,13 @@ class CurriculumCallback(BaseCallback):
         self.check_freq = check_freq
         self.win_threshold = win_threshold
         self.n_eval = n_eval
+        self.stages = stages if stages is not None else list(STAGES)
         self._stage = 0
 
     def _on_step(self) -> bool:
         if self.n_calls % self.check_freq != 0:
             return True
-        if self._stage >= len(STAGES) - 1:
+        if self._stage >= len(self.stages) - 1:
             return True
 
         wins = 0
@@ -110,7 +112,7 @@ class CurriculumCallback(BaseCallback):
             obs, _ = self.eval_env.reset()
 
         win_rate = wins / self.n_eval
-        next_size = STAGES[self._stage + 1]
+        next_size = self.stages[self._stage + 1]
         if self.verbose >= 1:
             print(
                 f"\n[Curriculum] stage={self._stage}  vocab={len(self.target_vocab)}"
@@ -120,7 +122,7 @@ class CurriculumCallback(BaseCallback):
 
         if win_rate >= self.win_threshold:
             self._stage += 1
-            new_words = random.sample(self.all_answers, STAGES[self._stage])
+            new_words = random.sample(self.all_answers, self.stages[self._stage])
             self.target_vocab.clear()
             self.target_vocab.extend(new_words)
             if self.verbose >= 1:
@@ -153,25 +155,40 @@ def _make_model(vec_env, log_path: str, masked: bool):
     )
 
 
+def _active_stages(max_size: int) -> list[int]:
+    """Return STAGES capped at max_size, always ending exactly at max_size."""
+    stages = [s for s in STAGES if s < max_size]
+    stages.append(max_size)
+    return stages
+
+
 def train(
     timesteps: int = 1_000_000,
     n_envs: int = 8,
     curriculum: bool = False,
     masked: bool = False,
     dense_reward: bool = True,
+    top_k: int = 0,
 ) -> object:
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 
-    all_answers = list(ANSWERS)
+    if top_k > 0:
+        from solver_entropy import top_entropy_answers
+        all_answers = top_entropy_answers(top_k)
+    else:
+        all_answers = list(ANSWERS)
+
+    stages = _active_stages(len(all_answers))
+    env_kw = dict(answers=all_answers, action_words=all_answers) if top_k > 0 else {}
 
     if curriculum:
-        target_vocab: list[str] = random.sample(all_answers, STAGES[0])
-        make_env  = lambda: WordleEnv(shaped_reward=True,  dense_reward=dense_reward, target_vocab=target_vocab, use_mask=masked)
-        eval_env  = WordleEnv(shaped_reward=False, dense_reward=False, target_vocab=target_vocab, use_mask=masked)
+        target_vocab: list[str] = random.sample(all_answers, stages[0])
+        make_env  = lambda: WordleEnv(shaped_reward=True,  dense_reward=dense_reward, target_vocab=target_vocab, use_mask=masked, **env_kw)
+        eval_env  = WordleEnv(shaped_reward=False, dense_reward=False, target_vocab=target_vocab, use_mask=masked, **env_kw)
     else:
         target_vocab = all_answers
-        make_env  = lambda: WordleEnv(shaped_reward=True,  dense_reward=dense_reward, use_mask=masked)
-        eval_env  = WordleEnv(shaped_reward=False, dense_reward=False, use_mask=masked)
+        make_env  = lambda: WordleEnv(shaped_reward=True,  dense_reward=dense_reward, use_mask=masked, **env_kw)
+        eval_env  = WordleEnv(shaped_reward=False, dense_reward=False, use_mask=masked, **env_kw)
 
     vec_env = VecMonitor(make_vec_env(make_env, n_envs=n_envs))
     model   = _make_model(vec_env, LOG_PATH, masked)
@@ -186,11 +203,12 @@ def train(
                 check_freq=max(20_000 // n_envs, 1),
                 win_threshold=0.80,
                 n_eval=300,
+                stages=stages,
             )
         )
 
     EvalCB = _eval_callback_class(masked)
-    eval_vec = make_vec_env(lambda: WordleEnv(shaped_reward=False, use_mask=masked), n_envs=4)
+    eval_vec = make_vec_env(lambda: WordleEnv(shaped_reward=False, use_mask=masked, **env_kw), n_envs=4)
     callbacks.append(
         EvalCB(
             eval_vec,
@@ -265,6 +283,8 @@ def main() -> None:
     parser.add_argument("--n_envs",          type=int, default=8)
     parser.add_argument("--curriculum",      action="store_true")
     parser.add_argument("--masked",          action="store_true")
+    parser.add_argument("--top_k",           type=int, default=0,
+                        help="Restrict action+target space to top-K entropy answers (0=all 2315)")
     parser.add_argument("--no_dense_reward", action="store_true",
                         help="Disable per-step dense reward (terminal rewards only)")
     parser.add_argument("--eval",            action="store_true")
@@ -285,6 +305,7 @@ def main() -> None:
             curriculum=args.curriculum,
             masked=args.masked,
             dense_reward=not args.no_dense_reward,
+            top_k=args.top_k,
         )
 
     print("\nEvaluating on full word bank …")
