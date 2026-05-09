@@ -43,6 +43,7 @@ from words import ANSWERS
 
 _q: "queue.Queue[dict]" = queue.Queue(maxsize=600)
 _slow = threading.Event()   # set once rolling avg ≤ SLOW_THRESHOLD
+_stop = threading.Event()   # set by pygame thread to request graceful shutdown
 
 ROLLING_WIN    = 50          # window for rolling average
 SLOW_THRESHOLD = 6.0         # trigger slow mode when avg ≤ this
@@ -119,6 +120,9 @@ class VizCallback(BaseCallback):
 
         if _delay[0] > 0:
             time.sleep(_delay[0])
+
+        if _stop.is_set():
+            return False   # tells model.learn() to stop → finally block saves
 
         return True
 
@@ -440,7 +444,7 @@ def main() -> None:
     t = threading.Thread(
         target=_train,
         args=(args.timesteps, args.n_steps, args.curriculum, args.masked, args.top_k),
-        daemon=True,
+        daemon=False,
     )
     t.start()
 
@@ -449,10 +453,12 @@ def main() -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+                _stop.set()
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
+                    _stop.set()
                 # +/= or numpad + → speed up (increase delay)
                 elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
                     _change_delay(DELAY_STEP)
@@ -496,6 +502,10 @@ def main() -> None:
         clock.tick(30)
 
     pygame.quit()
+
+    if t.is_alive():
+        print("Waiting for model to save …")
+        t.join()
 
 
 if __name__ == "__main__":
