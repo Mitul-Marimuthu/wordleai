@@ -13,7 +13,9 @@ Usage
 """
 
 import argparse
+import datetime
 import os
+import sys
 from collections import defaultdict
 
 import numpy as np
@@ -131,6 +133,26 @@ def cluster_report(losses: list[dict], words: list[str], top_n: int = 20) -> Non
         print(f"  {k} guesses : {dist[k]}")
 
 
+class _Tee:
+    """Write to both stdout and a file simultaneously."""
+    def __init__(self, path: str) -> None:
+        self._file = open(path, "w", encoding="utf-8")
+        self._stdout = sys.stdout
+        sys.stdout = self
+
+    def write(self, data: str) -> None:
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self) -> None:
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self) -> None:
+        sys.stdout = self._stdout
+        self._file.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--top_k", type=int, default=0,
@@ -149,14 +171,23 @@ def main() -> None:
         import random
         words = random.sample(words, min(args.n, len(words)))
 
-    print(f"Running failure audit on {len(words):,} words …\n")
-    losses = run_audit(words)
+    os.makedirs("logs", exist_ok=True)
+    stamp   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    logpath = os.path.join("logs", f"audit_{stamp}.txt")
+    tee = _Tee(logpath)
+    print(f"Logging to {logpath}\n")
 
-    if not losses:
-        print("No losses — 100% win rate!")
-        return
+    try:
+        print(f"Running failure audit on {len(words):,} words …\n")
+        losses = run_audit(words)
 
-    cluster_report(losses, words)
+        if not losses:
+            print("No losses — 100% win rate!")
+        else:
+            cluster_report(losses, words)
+    finally:
+        tee.close()
+        print(f"\nLog saved → {logpath}", file=sys.stdout)
 
 
 if __name__ == "__main__":
