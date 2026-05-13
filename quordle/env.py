@@ -166,10 +166,12 @@ class QuordleEnv(gym.Env):
         before = [int(self._possible[b].sum()) for b in range(N_BOARDS)]
 
         reward = 0.0
+        patterns: list[str | None] = [None] * N_BOARDS
         for b in range(N_BOARDS):
             if self._solved[b]:
                 continue
             pattern = evaluate_guess(guess, self._targets[b])
+            patterns[b] = pattern
             self._games[b].append((guess, pattern))
             self._update_obs(b, guess, pattern)
             self._update_possible(b, guess, pattern)
@@ -200,6 +202,7 @@ class QuordleEnv(gym.Env):
         self._done = terminated
         info = {
             "guess":    guess,
+            "patterns": patterns,          # list[str|None] — None for already-solved boards
             "n_guesses": self._n_guesses,
             "solved":   list(self._solved),
             "n_solved": sum(self._solved),

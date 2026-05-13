@@ -74,15 +74,14 @@ class VizCallback(BaseCallback):
         done = bool(self.locals["dones"][0])
 
         if "guess" in info:
-            guess   = info["guess"]
-            solved  = info["solved"]
-            # append guess to all boards that weren't yet solved last step
+            guess    = info["guess"]
+            patterns = info.get("patterns", [None] * N_BOARDS)
             for b in range(N_BOARDS):
-                if len(self._games[b]) < info["n_guesses"]:
-                    self._games[b].append((guess, "-----"))   # placeholder
+                if patterns[b] is not None:
+                    self._games[b].append((guess, patterns[b]))
 
         _put({"type": "step", "games": [list(g) for g in self._games],
-              "solved": info.get("solved", [False]*N_BOARDS)})
+              "solved": info.get("solved", [False] * N_BOARDS)})
 
         if done:
             n_solved = info.get("n_solved", 0)
