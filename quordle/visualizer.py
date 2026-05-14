@@ -23,6 +23,14 @@ Usage
 
 import argparse
 import os
+import sys
+
+# Ensure quordle/ takes priority over wordle/ in sys.path — env.py adds
+# ../wordle to sys.path, which would otherwise shadow quordle's train_rl.py.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if sys.path and sys.path[0] != _HERE:
+    sys.path.insert(0, _HERE)
+
 import queue
 import threading
 import time
