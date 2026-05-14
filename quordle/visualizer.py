@@ -130,7 +130,7 @@ class VizCallback(BaseCallback):
 
 def _train(timesteps: int, n_steps: int, curriculum: bool) -> None:
     import random
-    from train_rl import CurriculumCallback, _active_stages
+    from curriculum import CurriculumCallback, _active_stages
 
     all_ans = list(ANSWERS)
     stages  = _active_stages(len(all_ans))
