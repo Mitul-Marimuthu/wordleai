@@ -256,6 +256,15 @@ def draw_boards(surf: pygame.Surface,
     for b in range(N_BOARDS):
         bx, by = _BOARD_POS[b]
 
+        # Green border around entire board when solved
+        if solved[b]:
+            pad = 5
+            pygame.draw.rect(
+                surf, C["correct"],
+                (bx - pad, by - pad, BOARD_W + pad * 2, BOARD_H + pad * 2),
+                width=3, border_radius=6,
+            )
+
         # Board label
         label = font_md.render(
             f"{'✓' if solved[b] else f'B{b+1}'}",
