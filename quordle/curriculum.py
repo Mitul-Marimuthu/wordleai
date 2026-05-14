@@ -3,7 +3,7 @@ quordle/train_rl.py — curriculum callback and training helpers for Quordle.
 
 Curriculum design
 -----------------
-Target vocab expands in stages: 30 → 100 → 300 → 1000 → 2315 words.
+Target vocab expands in stages: 15 → 50 → 150 → 500 → 2315 words.
 Action space stays fixed at Discrete(2315) throughout so the policy network
 never needs to be rebuilt.  Only the *target pool* changes via a shared
 mutable list — all envs see the update on their next reset().
@@ -18,7 +18,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from env import QuordleEnv, N_BOARDS
 
-STAGES = [30, 100, 300, 1_000, 2_315]
+STAGES = [15, 50, 150, 500, 2_315]
 
 
 def _active_stages(max_size: int) -> list[int]:
