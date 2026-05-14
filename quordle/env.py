@@ -68,6 +68,7 @@ class QuordleEnv(gym.Env):
         self,
         answers: list[str] | None = None,
         action_words: list[str] | None = None,
+        target_vocab: list[str] | None = None,
         shaped_reward: bool = True,
         dense_reward: bool = True,
         use_mask: bool = False,
@@ -76,6 +77,7 @@ class QuordleEnv(gym.Env):
         super().__init__()
         self.answers      = answers      if answers      is not None else list(ANSWERS)
         self.action_words = action_words if action_words is not None else self.answers
+        self.target_vocab = target_vocab   # shared mutable list; None = use self.answers
         self.shaped_reward = shaped_reward
         self.dense_reward  = dense_reward
         self.use_mask      = use_mask
@@ -138,9 +140,10 @@ class QuordleEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
 
-        # Sample 4 distinct targets
-        pool = list(self.answers)
-        idxs = self.np_random.choice(len(pool), size=N_BOARDS, replace=False)
+        # Sample 4 distinct targets from the current vocab (curriculum-aware)
+        pool = list(self.target_vocab) if self.target_vocab is not None else self.answers
+        n    = min(N_BOARDS, len(pool))
+        idxs = self.np_random.choice(len(pool), size=n, replace=False)
         self._targets = [pool[i] for i in idxs]
 
         self._states = [np.zeros(BOARD_OBS, dtype=np.float32) for _ in range(N_BOARDS)]

@@ -33,6 +33,7 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 
 from env import QuordleEnv, MAX_GUESSES, N_BOARDS
+from words import ANSWERS
 
 # ─── Shared state ─────────────────────────────────────────────────────────────
 
@@ -49,6 +50,9 @@ DELAY_STEP = 0.25
 DELAY_MAX  = 5.0
 
 _btn: dict[str, pygame.Rect] = {}
+
+# Current curriculum vocab size — written by training thread, read by render thread.
+_vocab_size: list[int] = [2315]
 
 
 def _change_delay(delta: float) -> None:
@@ -116,8 +120,34 @@ class VizCallback(BaseCallback):
 
 # ─── Training thread ──────────────────────────────────────────────────────────
 
-def _train(timesteps: int, n_steps: int) -> None:
-    env = QuordleEnv(shaped_reward=True, dense_reward=True, use_mask=True)
+def _train(timesteps: int, n_steps: int, curriculum: bool) -> None:
+    import random
+    from train_rl import CurriculumCallback, _active_stages
+
+    all_ans = list(ANSWERS)
+    stages  = _active_stages(len(all_ans))
+
+    if curriculum:
+        tv  = random.sample(all_ans, stages[0])
+        _vocab_size[0] = len(tv)
+        env = QuordleEnv(shaped_reward=True,  dense_reward=True,  use_mask=True, target_vocab=tv)
+        cur_cb = CurriculumCallback(
+            target_vocab  = tv,
+            all_answers   = all_ans,
+            eval_env      = QuordleEnv(shaped_reward=False, dense_reward=False,
+                                       use_mask=True, target_vocab=tv),
+            check_freq    = 30_000,
+            win_threshold = 0.50,
+            n_eval        = 200,
+            stages        = stages,
+            verbose       = 1,
+            on_advance    = lambda n: _vocab_size.__setitem__(0, n),
+        )
+        cbs: list = [VizCallback(), cur_cb]
+    else:
+        _vocab_size[0] = len(all_ans)
+        env = QuordleEnv(shaped_reward=True, dense_reward=True, use_mask=True)
+        cbs = [VizCallback()]
 
     if os.path.exists(MODEL_PATH + ".zip"):
         print("[viz] Resuming from existing model …")
@@ -139,7 +169,7 @@ def _train(timesteps: int, n_steps: int) -> None:
         )
 
     try:
-        model.learn(total_timesteps=timesteps, callback=CallbackList([VizCallback()]))
+        model.learn(total_timesteps=timesteps, callback=CallbackList(cbs))
     finally:
         os.makedirs(MODEL_DIR, exist_ok=True)
         model.save(MODEL_PATH)
@@ -308,6 +338,7 @@ def draw_stats(surf: pygame.Surface,
                ep_num: int,
                avg: float,
                win_rate: float,
+               vocab_size: int,
                done: bool) -> None:
 
     sy = H - STATS_H
@@ -325,6 +356,7 @@ def draw_stats(surf: pygame.Surface,
         (f"episode  {ep_num:,}", C["text"]),
         (f"avg boards  {avg:.2f} / {N_BOARDS}", C["avg"]),
         (f"win rate  {win_rate:.1%}", wr_col),
+        (f"vocab  {vocab_size:,}", C["dim"]),
     ]
     if done:
         items.append(("training complete", C["win"]))
@@ -361,8 +393,10 @@ def draw_stats(surf: pygame.Surface,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--timesteps", type=int, default=3_000_000)
-    parser.add_argument("--n_steps",   type=int, default=512)
+    parser.add_argument("--timesteps",  type=int, default=3_000_000)
+    parser.add_argument("--n_steps",    type=int, default=512)
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Stage vocab from 30 → 2315 words as win rate improves")
     args = parser.parse_args()
 
     pygame.init()
@@ -380,17 +414,18 @@ def main() -> None:
         font_sm = pygame.font.Font(None, 16)
 
     state = {
-        "games":   [[] for _ in range(N_BOARDS)],
-        "solved":  [False] * N_BOARDS,
-        "hist":    [],
-        "avg":     0.0,
-        "ep":      0,
-        "done":    False,
+        "games":      [[] for _ in range(N_BOARDS)],
+        "solved":     [False] * N_BOARDS,
+        "hist":       [],
+        "avg":        0.0,
+        "ep":         0,
+        "vocab_size": len(ANSWERS),
+        "done":       False,
     }
 
     t = threading.Thread(
         target=_train,
-        args=(args.timesteps, args.n_steps),
+        args=(args.timesteps, args.n_steps, args.curriculum),
         daemon=False,
     )
     t.start()
@@ -437,7 +472,8 @@ def main() -> None:
         draw_boards(screen, font_lg, font_md,
                     state["games"], state["solved"], state["ep"])
         draw_graph(screen, font_md, font_sm, hist, state["avg"])
-        draw_stats(screen, font_md, state["ep"], state["avg"], win_rate, state["done"])
+        draw_stats(screen, font_md, state["ep"], state["avg"],
+                   win_rate, _vocab_size[0], state["done"])
 
         pygame.display.flip()
         clock.tick(30)
